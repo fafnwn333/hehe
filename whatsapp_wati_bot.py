@@ -1,27 +1,27 @@
-import os
-import json
-import tempfile
-import requests
 from flask import Flask, request, jsonify
+import os
+import requests
+import tempfile
+import fal_client
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-import fal_client
 
-# === Configuration ===
-WATI_API_URL = "https://app.wati.io/api/v1"
-WATI_TOKEN = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI1N2JiZjgwNS0wYjM2LTQ1MTAtYjg4ZS03NzZlMjg2OTE3NDEiLCJ..."
-FAL_API_KEY = "d0ef57c7-5a0e-4a87-aa66-281b437bc0ae:3aaa35e26a361b9783c55d6b2781fc48"
+# === WATI Config ===
+WATI_BEARER_TOKEN = os.getenv("WATI_BEARER_TOKEN") or "YOUR_WATI_BEARER_TOKEN"
+
+# === Google Drive Config ===
+SERVICE_ACCOUNT_FILE = 'service_account.json'
+DRIVE_FOLDER_ID = '1CxYhtopcXOofh0UGgVLyL3zyN5-wmiLE'
+
+# === Set FAL API Key ===
+FAL_API_KEY = os.getenv("FAL_API_KEY") or "d0ef57c7-5a0e-4a87-aa66-281b437bc0ae:3aaa35e26a361b9783c55d6b2781fc48"
 os.environ["FAL_KEY"] = FAL_API_KEY
-
-SERVICE_ACCOUNT_FILE = "service_account.json"
-DRIVE_FOLDER_ID = "1CxYhtopcXOofh0UGgVLyL3zyN5-wmiLE"
-
-# === User State ===
-user_state = {}
 
 # === Flask App ===
 app = Flask(__name__)
+user_states = {}
+
 
 def upload_to_drive(file_path, filename):
     creds = service_account.Credentials.from_service_account_file(
@@ -31,7 +31,7 @@ def upload_to_drive(file_path, filename):
     service = build("drive", "v3", credentials=creds)
 
     file_metadata = {'name': filename, 'parents': [DRIVE_FOLDER_ID]}
-    media = MediaFileUpload(file_path, mimetype='image/jpeg')
+    media = MediaFileUpload(file_path, mimetype='image/jpeg', resumable=True)
     uploaded_file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
 
     service.permissions().create(
@@ -41,54 +41,65 @@ def upload_to_drive(file_path, filename):
 
     return f"https://drive.google.com/uc?id={uploaded_file['id']}"
 
-def send_wati_message(phone, text):
+
+def send_wati_message(phone, message):
     headers = {
-        "Authorization": WATI_TOKEN,
+        "Authorization": f"Bearer {WATI_BEARER_TOKEN}",
         "Content-Type": "application/json"
     }
-    payload = {
+    data = {
         "whatsappNumber": phone,
-        "messageText": text
+        "messageText": message
     }
-    requests.post(f"{WATI_API_URL}/sendSessionMessage", headers=headers, json=payload)
+    requests.post("https://app.wati.io/api/v1/sendSessionMessage", headers=headers, json=data)
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.json
-    phone = data["waId"]
-    message = data.get("text", "").strip()
-    media = data.get("media", [])
 
-    state = user_state.get(phone, {})
+def send_wati_image(phone, image_url, caption=""):
+    headers = {
+        "Authorization": f"Bearer {WATI_BEARER_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "whatsappNumber": phone,
+        "fileName": "image.jpg",
+        "fileUrl": image_url,
+        "caption": caption
+    }
+    requests.post("https://app.wati.io/api/v1/sendMediaMessage", headers=headers, json=data)
 
-    # 1. Handle image upload
-    if media and media[0].get("type") == "image":
-        image_url = media[0]["url"]
-        temp_image = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-        img_data = requests.get(image_url, headers={"Authorization": WATI_TOKEN}).content
-        temp_image.write(img_data)
-        temp_image.close()
 
-        state["image_path"] = temp_image.name
-        user_state[phone] = state
+@app.route("/", methods=["GET"])
+def home():
+    return "✅ WhatsApp bot is live!"
 
-        send_wati_message(phone, "✅ Image received. Now send me your prompt.")
-        return jsonify(success=True)
 
-    # 2. Handle prompt input
-    if "image_path" in state and "prompt" not in state:
-        state["prompt"] = message
-        user_state[phone] = state
-        send_wati_message(phone, f"🎨 Generating image with prompt: *{message}*")
+@app.route("/wati-webhook", methods=["POST"])
+def receive_wati_message():
+    data = request.get_json()
+    phone = data.get("waId")
+    text = data.get("text", "").strip()
+
+    if not phone:
+        return jsonify({"status": "error", "message": "No phone number found"}), 400
+
+    state = user_states.get(phone, {})
+
+    if not state:
+        user_states[phone] = {"step": "awaiting_image"}
+        send_wati_message(phone, "📸 Please upload an image to begin.")
+    elif state["step"] == "awaiting_prompt":
+        user_states[phone]["prompt"] = text
+        user_states[phone]["step"] = "processing"
+        send_wati_message(phone, "🎨 Editing image with your prompt. Please wait...")
 
         try:
-            # Upload image to drive
-            drive_url = upload_to_drive(state["image_path"], os.path.basename(state["image_path"]))
+            drive_url = state["image_url"]
+            prompt = state["prompt"]
 
             result = fal_client.submit(
                 "fal-ai/flux-pro/kontext",
                 arguments={
-                    "prompt": message,
+                    "prompt": prompt,
                     "guidance_scale": 3.5,
                     "num_images": 1,
                     "safety_tolerance": "2",
@@ -97,21 +108,47 @@ def webhook():
                 }
             ).get()
 
-            img_url = result["images"][0]["url"]
-            send_wati_message(phone, f"✅ Here is your image: {img_url}")
-            send_wati_message(phone, "🌀 Want to generate another? Send me a new image!")
+            image_url = result["images"][0]["url"]
+            send_wati_image(phone, image_url, "✅ Here's your edited image!")
+            send_wati_message(phone, "✨ Want to generate more images? Send another image.")
+            user_states.pop(phone, None)
 
         except Exception as e:
             send_wati_message(phone, f"⚠️ Error: {str(e)}")
-
-        # Reset state
-        user_state.pop(phone, None)
-
+            user_states.pop(phone, None)
     else:
-        send_wati_message(phone, "👋 Welcome! Please send an image to get started.")
+        send_wati_message(phone, "📸 Please upload an image first.")
 
-    return jsonify(success=True)
+    return jsonify({"status": "ok"})
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
 
+@app.route("/wati-media", methods=["POST"])
+def receive_wati_media():
+    data = request.get_json()
+    phone = data.get("waId")
+    media_url = data.get("mediaUrl")
+
+    if not phone or not media_url:
+        return jsonify({"status": "error", "message": "Missing phone or media"}), 400
+
+    # Download image
+    r = requests.get(media_url)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
+        temp_file.write(r.content)
+        temp_file_path = temp_file.name
+
+    try:
+        uploaded_url = upload_to_drive(temp_file_path, os.path.basename(temp_file_path))
+        user_states[phone] = {"step": "awaiting_prompt", "image_url": uploaded_url}
+        send_wati_message(phone, "📝 Image received. Now send your prompt.")
+    except Exception as e:
+        send_wati_message(phone, f"❌ Failed to process image: {str(e)}")
+    finally:
+        os.remove(temp_file_path)
+
+    return jsonify({"status": "ok"})
+
+
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
